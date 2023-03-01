@@ -1,0 +1,231 @@
+kind: pipeline
+name: Deploy
+
+platform:
+  arch: amd64
+  os: linux
+
+steps:
+  - name: publish
+    image: plugins/ecr:19.03
+    settings:
+      region: us-east-1
+      repo: skeleton-nodejs-${DRONE_BRANCH}
+      tags:
+        - ${DRONE_COMMIT}
+        - latest
+      registry: 496322436382.dkr.ecr.us-east-1.amazonaws.com
+      context: ./app
+      target: prod
+      dockerfile: ./app/Dockerfile
+      build_args_from_env:
+        - DB_SERVER
+        - DB_PORT
+        - DB_DATABASE
+        - DB_USER
+        - DB_PASSWORD
+        - INFRA_ENVIRONMENT
+        - NODE_ENV
+    environment:
+      DB_SERVER:
+        from_secret: DB_SERVER_${DRONE_BRANCH}
+      DB_PORT:
+        from_secret: DB_PORT_${DRONE_BRANCH}
+      DB_DATABASE:
+        from_secret: DB_NAME_${DRONE_BRANCH}
+      DB_USER:
+        from_secret: DB_USER_${DRONE_BRANCH}
+      DB_PASSWORD:
+        from_secret: DB_PASSWORD_${DRONE_BRANCH}
+      DATADOG_APIKEY:
+        from_secret: DATADOG_APIKEY
+      DATADOG_APPLICATIONKEY:
+        from_secret: DATADOG_APPLICATIONKEY
+      DATADOG_VERSION: ${DRONE_COMMIT}
+      DATADOG_SERVICE: skeleton-nodejs
+      DATADOG_AGENT_HOST: datadog-prod.superlogica.com
+      DATADOG_TRACE_AGENT_PORT: 8126
+      INFRA_ENVIRONMENT: ${DRONE_BRANCH}
+      NODE_ENV: production
+
+  - name: deploy
+    image: gportugues/drone-ecs-deploy
+    settings:
+      cluster: arn:aws:ecs:us-east-1:496322436382:cluster/skeleton-nodejs-${DRONE_BRANCH}
+      service: skeleton-nodejs-${DRONE_BRANCH}
+      image_name: 496322436382.dkr.ecr.us-east-1.amazonaws.com/skeleton-nodejs-${DRONE_BRANCH}:${DRONE_COMMIT}
+      aws_region: us-east-1
+      timeout: "1200"
+      max: "200"
+      min: "100"
+      task_definition:
+        {
+          "taskDefinition":
+            {
+              "requiresCompatibilities": ["FARGATE", "EC2"],
+              "networkMode": "awsvpc",
+            },
+        }
+    environment:
+      FORCE_NEW_DEPLOYMENT: true
+    depends_on:
+      - publish
+
+trigger:
+  branch:
+    include:
+      - prod
+      - staging
+  event:
+    exclude:
+      - pull_request
+            
+---
+kind: pipeline
+name: Tests
+
+platform:
+  arch: amd64
+  os: linux
+
+steps:
+  - name: build-app-image
+    image: public.ecr.aws/docker/library/docker
+    volumes:
+      - name: docker_sock
+        path: /var/run/docker.sock
+    commands:
+      - cd app
+      - docker build
+        --target ci
+        --build-arg NODE_ENV=test
+        --build-arg DB_SERVER=mysql
+        --build-arg DB_PORT=3306
+        --build-arg DB_DATABASE=test
+        --build-arg DB_USER=skeleton_node
+        --build-arg DB_PASSWORD=skeleton_node
+        -t app:$DRONE_COMMIT .
+
+  - name: run-tests
+    image: app:${DRONE_COMMIT}
+    pull: if-not-exists
+    commands:
+      - cd /opt/node_app/app
+      - npm run ci
+    depends_on:
+      - build-app-image
+
+volumes:
+  - name: docker_sock
+    host:
+      path: /var/run/docker.sock
+
+services:
+  - name: mysql
+    image: public.ecr.aws/docker/library/mysql:8
+    ports:
+      - 3306
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test
+      MYSQL_USER: skeleton_node
+      MYSQL_PASSWORD: skeleton_node
+    command: ["--default-authentication-plugin=mysql_native_password"]
+
+trigger:
+  event:
+    - pull_request
+
+---
+kind: pipeline
+name: Sonar
+
+platform:
+  arch: amd64
+  os: linux
+
+environment:
+  COVERAGE_DIRECTORY: /test_coverage/$$DRONE_REPO/$$DRONE_BUILD_NUMBER
+
+steps:
+  - name: build-app-image
+    image: public.ecr.aws/docker/library/docker
+    volumes:
+      - name: docker_sock
+        path: /var/run/docker.sock
+    commands:
+      - cd app
+      - docker build
+        --target ci
+        --build-arg NODE_ENV=test
+        --build-arg DB_SERVER=mysql
+        --build-arg DB_PORT=3306
+        --build-arg DB_DATABASE=test
+        --build-arg DB_USER=skeleton_node
+        --build-arg DB_PASSWORD=skeleton_node
+        -t app:$DRONE_COMMIT .
+
+  - name: run-tests
+    image: app:${DRONE_COMMIT}
+    pull: if-not-exists
+    volumes:
+      - name: test_coverage
+        path: /test_coverage
+    commands:
+      - mkdir -p $$COVERAGE_DIRECTORY
+      - cd /opt/node_app/app
+      - npm run ci
+      - cp -rf ./.nyc_output $$COVERAGE_DIRECTORY/.
+    depends_on:
+      - build-app-image
+
+  - name: sonar-scan
+    image: sonarsource/sonar-scanner-cli
+    volumes:
+      - name: test_coverage
+        path: /test_coverage
+    commands:
+      - cd ./app
+      - mkdir .nyc_output   
+      - cp -rf $$COVERAGE_DIRECTORY/.nyc_output .
+      - sonar-scanner
+        -Dsonar.projectKey=skeleton-nodejs
+        -Dsonar.sources=.
+        -Dsonar.exclusions=test/**/*
+        -Dsonar.host.url=https://sonar.superlogica.com
+        -Dsonar.login=$SONAR_PROJECT_TOKEN
+        -Dsonar.projectVersion=$DRONE_COMMIT_SHA
+        -Dsonar.javascript.lcov.reportPaths=./.nyc_output/lcov.info
+    environment:
+      BROWSERSLIST_IGNORE_OLD_DATA: true
+      SONAR_PROJECT_TOKEN:
+        from_secret: SONAR_PROJECT_TOKEN
+    depends_on:
+      - run-tests
+
+volumes:
+  - name: docker_sock
+    host:
+      path: /var/run/docker.sock
+  - name: test_coverage
+    host:
+      path: /tmp/test_coverage
+
+
+services:
+  - name: mysql
+    image: public.ecr.aws/docker/library/mysql:8
+    ports:
+      - 3306
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test
+      MYSQL_USER: skeleton_node
+      MYSQL_PASSWORD: skeleton_node
+    command: ["--default-authentication-plugin=mysql_native_password"]
+
+trigger:
+  event:
+    - push
+  branch: 
+    - main

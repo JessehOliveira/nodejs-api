@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+
+  mysql_skeleton_node:
+    image: mysql:8
+    ports:
+      - 3306:3306
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=skeleton_node
+      - MYSQL_USER=skeleton_node
+      - MYSQL_PASSWORD=skeleton_node
+    healthcheck:
+      test: [ "CMD", "mysqladmin" ,"ping", "-h", "localhost" ]
+      timeout: 20s
+      retries: 10
+    volumes:
+      - ./data/mysql-data:/var/local/mysql/data
+
+  skeleton_node:
+    build:
+      context: ./app
+      dockerfile: ./Dockerfile
+      target: ${TARGET:-dev}
+      args:
+        - NODE_ENV=development
+        - DB_SERVER=mysql_skeleton_node
+        - DB_PORT=3306
+        - DB_DATABASE=skeleton_node
+        - DB_USER=skeleton_node
+        - DB_PASSWORD=skeleton_node
+      network: host
+    tty: true
+    volumes:
+      - ./app:/opt/node_app/app:delegated
+    ports:
+      - 8000:8000
+      - 5000:5000
+    depends_on:
+      mysql_skeleton_node:
+        condition: service_healthy
